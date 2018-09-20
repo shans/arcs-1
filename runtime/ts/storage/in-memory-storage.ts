@@ -14,6 +14,8 @@ import {CrdtCollectionModel} from './crdt-collection-model.js';
 import {Id} from '../id.js';
 import {Type} from '../type.js';
 
+import {DLog} from '../../debug.js';
+
 export function resetInMemoryStorageForTesting() {
   for (const key of Object.keys(__storageCache)) {
     __storageCache[key]._memoryMap = {};

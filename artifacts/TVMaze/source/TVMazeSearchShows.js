@@ -41,6 +41,7 @@ defineParticle(({DomParticle, html, resolver, log}) => {
       data = data.filter(({show}) => show.image && show.image.medium && (!shows || !shows.find(s => show.id == s.showid)));
       const rawData = data.map(({show}) => this.showToEntity(show));
       //await this.clearHandle('shows');
+      console.log("TVMazeSearchShows::receiveShows", rawData);
       await this.appendRawDataToHandle('shows', rawData);
     }
     showToEntity(show) {

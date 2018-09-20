@@ -21,6 +21,8 @@ import {CrdtCollectionModel} from './crdt-collection-model.js';
 import {Id} from '../id.js';
 import {Type} from '../type.js';
 
+import {DLog} from '../../debug.js';
+
 export async function resetStorageForTesting(key) {
   key = new FirebaseKey(key);
   const app = firebase.initializeApp({
@@ -311,21 +313,24 @@ abstract class FirebaseStorageProvider extends StorageProviderBase {
 
   abstract get _hasLocalChanges(): boolean;
 
-  abstract async _persistChangesImpl(arg): Promise<void>;
+  abstract async _persistChangesImpl(): Promise<void>;
 
-  async _persistChanges(arg='') {
-    if (!this._hasLocalChanges) {
-      return;
+  async _persistChanges() {
+    while (this._hasLocalChanges) {
+      DLog.log(this, 'there are local changes');
+      try {
+        if (!this.persisting) {
+          DLog.log(this, 'generating new persistChangesImpl promise');
+          this.persisting = this._persistChangesImpl();
+        }
+        DLog.log(this, 'awaiting')
+        await this.persisting;
+        this.persisting = null;
+      } catch (e) {
+        DLog.logObject(this, e, 'well shit');
+      }
+      DLog.log(this, 'done');
     }
-    if (this.persisting) {
-      await this.persisting;
-      return;
-    }
-    // Ensure we only have one persist process running at a time.
-    this.persisting = this._persistChangesImpl(arg);
-    await this.persisting;
-    assert(!this._hasLocalChanges);
-    this.persisting = null;
   }
 }
 
@@ -432,7 +437,7 @@ class FirebaseVariable extends FirebaseStorageProvider {
     return this.localModified;
   }
 
-  async _persistChangesImpl(arg): Promise<void> {
+  async _persistChangesImpl(): Promise<void> {
     assert(this.localModified);
     // Guard the specific version that we're writing. If we receive another
     // local mutation, these versions will be different when the transaction
@@ -473,7 +478,7 @@ class FirebaseVariable extends FirebaseStorageProvider {
  
     if (this.version !== version) {
       // A new local modification happened while we were writing the previous one.
-      return this._persistChangesImpl(arg);
+      return this._persistChangesImpl();
     }
 
     this.localModified = false;
@@ -525,7 +530,7 @@ class FirebaseVariable extends FirebaseStorageProvider {
     }
     this.localModified = true;
 
-    await this._persistChanges(barrier);
+    await this._persistChanges();
 
     this._fire('change', {data: value, version, originatorId, barrier});
   }
@@ -654,6 +659,8 @@ class FirebaseCollection extends FirebaseStorageProvider {
   private pendingWrites: {value: {}, storageKey: string}[] = [];
   private resolveInitialized: () => void;
   private localId = 0;
+  private debugId = 0;
+  private FUCKTHEPLANET = false;
 
   constructor(type, storageEngine, id, reference, firebaseKey) {
     super(type, storageEngine, id, reference, firebaseKey);
@@ -799,6 +806,8 @@ class FirebaseCollection extends FirebaseStorageProvider {
       const ids = add.map(({value}) => value.id).concat(remove.map(({value}) => value.id));
       this.ensureBackingStore().then(async backingStore => {
         const values = await backingStore.getMultiple(ids);
+        DLog.traceObject(this, values, 'values');
+        DLog.logObject(this, ids, 'ids');
         const valueMap = {};
         values.forEach(value => valueMap[value.id] = value);
         const addPrimitives = add.map(({value, keys, effective}) => ({value: valueMap[value.id], keys, effective}));
@@ -863,6 +872,7 @@ class FirebaseCollection extends FirebaseStorageProvider {
   }
 
   async store(value, keys, originatorId=null) {
+    DLog.traceObject(this, value, 'value');
     assert(keys != null && keys.length > 0, 'keys required');
     await this.initialized;
     const id = value.id;
@@ -874,6 +884,7 @@ class FirebaseCollection extends FirebaseStorageProvider {
       effective = this.model.add(id, {id, storageKey}, keys);
       this.version++;
       this.pendingWrites.push({value, storageKey});
+      DLog.log(this, `pushed to writes, length ${this.pendingWrites.length}`);
     } else {
       effective = this.model.add(id, value, keys);
       this.version++;
@@ -897,24 +908,39 @@ class FirebaseCollection extends FirebaseStorageProvider {
   }
 
   get _hasLocalChanges() {
-    return this.localChanges.size > 0;
+    return this.localChanges.size > 0 || this.pendingWrites.length > 0;
   }
 
   async _persistChangesImpl(): Promise<void> {
+    DLog.trace(this, `${this.pendingWrites.length} ${this.localChanges.size}`);
     if (this.pendingWrites.length > 0) {
+      DLog.log(this, `clearing >=${this.pendingWrites.length} pending writes`);
       await this.ensureBackingStore();      
       assert(this.backingStore);
       const pendingWrites = this.pendingWrites.slice();
       this.pendingWrites = [];
+      DLog.log(this, `cleared ${pendingWrites.length} pending writes`);
 
       // TODO(shans): mutating the storageKey here to provide unique keys is a hack
       // that can be removed once entity mutation is distinct from collection updates.
       // Once entity mutation exists, it shouldn't ever be possible to write
       // different values with the same id.
       await Promise.all(pendingWrites.map(pendingItem => this.backingStore.store(pendingItem.value, [this.storageKey + this.localId++])));
+
+      // TODO(shans): Returning here prevents us from writing localChanges while there
+      // are pendingWrites. This in turn prevents change events for being generated for
+      // localChanges that have outstanding pendingWrites.
+      // A better approach would be to tie pendingWrites more closely to localChanges.
+      return;
     }
 
-    while (this.localChanges.size > 0) {
+    if (this.localChanges.size > 0) {
+      const id = this.debugId++;
+      if (this.FUCKTHEPLANET)
+        debugger;
+      this.FUCKTHEPLANET = true;
+      DLog.log(this, `about to go into localChanges processing ${id}`);
+
       // Record the changes that are persisted by the transaction.
       let changesPersisted;
       const result = await this._transaction(data => {
@@ -964,6 +990,9 @@ class FirebaseCollection extends FirebaseStorageProvider {
       // We're assuming that firebase won't deliver updates between the
       // transaction committing and the result promise resolving :/
 
+      DLog.log(this, `finished transaction bit ${id} ${result.committed}`);
+      this.FUCKTHEPLANET = false;
+
       assert(result.committed);
       const data = result.snapshot.val();
 
@@ -996,6 +1025,7 @@ class FirebaseCollection extends FirebaseStorageProvider {
           });
         }
       }
+      DLog.logObject(this, this.localChanges, `localChanges ${id}`);
     }
   }
 

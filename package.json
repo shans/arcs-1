@@ -67,6 +67,7 @@
     "rollup-plugin-multi-entry": "^2.0.2",
     "rollup-plugin-node-resolve": "^3.4.0",
     "source-map-support": "^0.5.9",
+    "stacktrace-js": "^2.0.0",
     "typescript": "^3.0.3",
     "ws": "^4.1.0"
   },
